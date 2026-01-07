@@ -1,0 +1,259 @@
+package com.medicare.server;
+
+import java.net.ServerSocket;
+import java.net.Socket;
+
+public class ServerMain {
+
+    // Change port if needed
+    public static final int PORT = 5050;
+
+    public static void main(String[] args) {
+        System.out.println("=== MediCare Oman Billing Server ===");
+        System.out.println("Listening on port " + PORT + " ...");
+
+        try (ServerSocket serverSocket = new ServerSocket(PORT)) {
+            while (true) {
+                Socket clientSocket = serverSocket.accept();
+                System.out.println("[Server] Connected: " + clientSocket.getInetAddress().getHostAddress());
+                new ClientHandler(clientSocket).start();
+            }
+        } catch (Exception e) {
+            System.err.println("[Server] Server stopped due to error: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+}
+package com.medicare.server;
+
+import com.medicare.common.BillingRequest;
+import com.medicare.common.BillingResponse;
+import com.medicare.common.Validation;
+
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.net.Socket;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+
+public class ClientHandler extends Thread {
+    private final Socket socket;
+
+    public ClientHandler(Socket socket) {
+        super("ClientHandler-" + socket.getInetAddress().getHostAddress());
+        this.socket = socket;
+    }
+
+    @Override
+    public void run() {
+        try (Socket s = socket;
+             ObjectOutputStream out = new ObjectOutputStream(s.getOutputStream());
+             ObjectInputStream in = new ObjectInputStream(s.getInputStream())) {
+
+            Object obj = in.readObject();
+            if (!(obj instanceof BillingRequest)) {
+                out.writeObject(new BillingResponse(false, "Invalid request object.", 0, "", 0, "",
+                        "", "", 0, 0, 0, 0, 0, 0, 0, 0));
+                return;
+            }
+
+            BillingRequest req = (BillingRequest) obj;
+
+            // Validate inputs (server side validation is important even if client validates too)
+            try {
+                Validation.validateRequest(req);
+            } catch (IllegalArgumentException ex) {
+                out.writeObject(new BillingResponse(false, ex.getMessage(), req.getPatientId(), "", 0, "",
+                        req.getServiceCode(), "", 0, 0, 0, 0, 0, 0, 0, 0));
+                return;
+            }
+
+            try (Connection con = DBUtil.getConnection()) {
+                Patient patient = getPatient(con, req.getPatientId());
+                if (patient == null) {
+                    out.writeObject(new BillingResponse(false, "Patient ID not found in database.", req.getPatientId(), "", 0, "",
+                            req.getServiceCode(), "", 0, 0, 0, 0, 0, 0, 0, 0));
+                    return;
+                }
+
+                BillingCalculator.BillBreakdown b = BillingCalculator.calculate(
+                        patient.insurancePlan,
+                        req.getPatientType(),
+                        req.getServiceCode()
+                );
+
+                insertBill(con, req, b.finalAmount);
+
+                BillingResponse resp = new BillingResponse(
+                        true,
+                        "Bill calculated and saved successfully.",
+                        patient.id,
+                        patient.name,
+                        patient.age,
+                        patient.insurancePlan,
+                        b.service.code,
+                        b.service.description,
+                        round2(b.baseFee),
+                        b.plan.percentDiscountRate,
+                        round2(b.insurancePercentDiscountAmount),
+                        round2(b.plan.perVisitDiscount),
+                        round2(b.discountedAmount),
+                        b.extraChargeRate,
+                        round2(b.extraChargeAmount),
+                        round2(b.finalAmount)
+                );
+
+                out.writeObject(resp);
+            }
+
+        } catch (Exception e) {
+            // In real systems you'd log this properly
+            System.err.println("[Server] Error handling client: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    private static Patient getPatient(Connection con, int patientId) throws Exception {
+        String sql = "SELECT id, name, age, insurancePlan FROM Patient WHERE id = ?";
+        try (PreparedStatement ps = con.prepareStatement(sql)) {
+            ps.setInt(1, patientId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return null;
+                return new Patient(
+                        rs.getInt("id"),
+                        rs.getString("name"),
+                        rs.getInt("age"),
+                        rs.getString("insurancePlan")
+                );
+            }
+        }
+    }
+
+    private static void insertBill(Connection con, BillingRequest req, double finalAmount) throws Exception {
+        String sql = "INSERT INTO PatientBill(patientId, visitDate, billAmount, serviceCode, patientType) VALUES (?,?,?,?,?)";
+        try (PreparedStatement ps = con.prepareStatement(sql)) {
+            ps.setInt(1, req.getPatientId());
+            ps.setString(2, req.getVisitDate());
+            ps.setDouble(3, finalAmount);
+            ps.setString(4, req.getServiceCode());
+            ps.setString(5, req.getPatientType());
+            ps.executeUpdate();
+        }
+    }
+
+    private static double round2(double v) {
+        return Math.round(v * 100.0) / 100.0;
+    }
+}
+
+package com.medicare.server;
+
+import java.util.Map;
+
+public final class BillingCalculator {
+
+    public static class ServiceInfo {
+        public final String code;
+        public final String description;
+        public final double fee;
+
+        public ServiceInfo(String code, String description, double fee) {
+            this.code = code;
+            this.description = description;
+            this.fee = fee;
+        }
+    }
+
+    public static class PlanInfo {
+        public final String plan;
+        public final double percentDiscountRate;  // e.g. 0.15
+        public final double perVisitDiscount;     // OMR
+
+        public PlanInfo(String plan, double percentDiscountRate, double perVisitDiscount) {
+            this.plan = plan;
+            this.percentDiscountRate = percentDiscountRate;
+            this.perVisitDiscount = perVisitDiscount;
+        }
+    }
+
+    public static final Map<String, ServiceInfo> SERVICES = Map.of(
+            "CONS100", new ServiceInfo("CONS100", "Consultation (General)", 12.00),
+            "LAB210",  new ServiceInfo("LAB210",  "Lab Test", 8.50),
+            "IMG330",  new ServiceInfo("IMG330",  "X-Ray", 25.00),
+            "US400",   new ServiceInfo("US400",   "Ultrasound", 35.00),
+            "MRI700",  new ServiceInfo("MRI700",  "MRI", 180.00)
+    );
+
+    public static final Map<String, PlanInfo> PLANS = Map.of(
+            "Premium",  new PlanInfo("Premium", 0.15, 5.00),
+            "Standard", new PlanInfo("Standard", 0.10, 8.00),
+            "Basic",    new PlanInfo("Basic", 0.00, 10.00)
+    );
+
+    public static double extraChargeRateForPatientType(String patientType) {
+        switch (patientType) {
+            case "Outpatient": return 0.00;
+            case "Inpatient":  return 0.05;
+            case "Emergency":  return 0.15;
+            default: throw new IllegalArgumentException("Unknown patient type: " + patientType);
+        }
+    }
+
+    public static BillBreakdown calculate(String insurancePlan, String patientType, String serviceCode) {
+        ServiceInfo service = SERVICES.get(serviceCode);
+        if (service == null) throw new IllegalArgumentException("Unknown service code: " + serviceCode);
+
+        PlanInfo plan = PLANS.get(insurancePlan);
+        if (plan == null) throw new IllegalArgumentException("Unknown insurance plan: " + insurancePlan);
+
+        double base = service.fee;
+
+        // Insurance % discount on base
+        double percentDiscountAmt = base * plan.percentDiscountRate;
+
+        // Apply per-visit discount as a fixed amount
+        double afterInsurance = base - percentDiscountAmt - plan.perVisitDiscount;
+
+        // Bills should not go negative
+        if (afterInsurance < 0) afterInsurance = 0;
+
+        // Extra charge on discounted amount
+        double extraRate = extraChargeRateForPatientType(patientType);
+        double extraAmt = afterInsurance * extraRate;
+
+        double finalAmt = afterInsurance + extraAmt;
+
+        return new BillBreakdown(service, plan, base, percentDiscountAmt, afterInsurance, extraRate, extraAmt, finalAmt);
+    }
+
+    public static class BillBreakdown {
+        public final ServiceInfo service;
+        public final PlanInfo plan;
+
+        public final double baseFee;
+        public final double insurancePercentDiscountAmount;
+        public final double discountedAmount; // after insurance discounts applied (floored at 0)
+
+        public final double extraChargeRate;
+        public final double extraChargeAmount;
+        public final double finalAmount;
+
+        public BillBreakdown(ServiceInfo service, PlanInfo plan,
+                             double baseFee,
+                             double insurancePercentDiscountAmount,
+                             double discountedAmount,
+                             double extraChargeRate,
+                             double extraChargeAmount,
+                             double finalAmount) {
+            this.service = service;
+            this.plan = plan;
+            this.baseFee = baseFee;
+            this.insurancePercentDiscountAmount = insurancePercentDiscountAmount;
+            this.discountedAmount = discountedAmount;
+            this.extraChargeRate = extraChargeRate;
+            this.extraChargeAmount = extraChargeAmount;
+            this.finalAmount = finalAmount;
+        }
+    }
+}
